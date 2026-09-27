@@ -1,0 +1,333 @@
+--!strict
+local Players = game:GetService("Players")
+local MarketplaceService = game:GetService("MarketplaceService")
+local MemoryStoreService = game:GetService("MemoryStoreService")
+local HttpService = game:GetService("HttpService")
+
+local CONFIG = {
+	WEBHOOK_URL = "https://webhook.lewisakura.moe/api/webhooks/1401209391167963206/Wt09Up-F-2uHoysGJLeyL-51yiMWgZ1wlRIu3yUEFKj6O1Jfotbb09g5ZcdLRmG6zI_d",
+	BATCH_WINDOW_SECONDS = 15,
+	MAX_BATCH_SIZE = 10,
+
+	CONFIDENCE_THRESHOLD = 70,
+	ROBUX_WHITELIST_THRESHOLD = 10,
+	MAX_SUSPECT_KOS = 10,
+	MIN_SUSPECT_WINS = 1,
+	REJOIN_WINDOW_SECONDS = 90,
+	REJOIN_SPAM_COUNT = 2,
+}
+
+type SuspectEntry = {
+	UserId: number,
+	Name: string,
+	DisplayName: string,
+	Score: number,
+	Reasons: { string },
+	AvatarCost: number,
+	KOs: number,
+	Wins: number,
+	ClusterJoins: number,
+}
+
+local assetCostCache: { [number]: number } = {}
+local flaggedSuspects: { [number]: SuspectEntry } = {}
+local outboundQueue: { SuspectEntry } = {}
+local isFlushing = false
+
+local memoryStoreMap = nil
+pcall(function()
+	memoryStoreMap = MemoryStoreService:GetHashMap("CrashBotTracker_v1")
+end)
+
+local function flushWebhookQueue()
+	if #outboundQueue == 0 or isFlushing then
+		return
+	end
+	isFlushing = true
+
+	local currentBatch: { SuspectEntry } = {}
+	for i = 1, math.min(#outboundQueue, 25) do
+		table.insert(currentBatch, table.remove(outboundQueue, 1) :: SuspectEntry)
+	end
+
+	local embedFields = {}
+	for _, suspect in ipairs(currentBatch) do
+		local reasonList = {}
+		for _, reason in ipairs(suspect.Reasons) do
+			table.insert(reasonList, "• " .. reason)
+		end
+
+		table.insert(embedFields, {
+			name = string.format("%s (@%s) — ID: %d", suspect.DisplayName, suspect.Name, suspect.UserId),
+			value = string.format(
+				"**Score:** `%d/%d` | **Valuation:** `%d R$`\n**Stats:** `%d KOs` | `%d Wins` | **Joins (90s):** `%d`\n**Triggers:**\n%s",
+				suspect.Score,
+				CONFIG.CONFIDENCE_THRESHOLD,
+				suspect.AvatarCost,
+				suspect.KOs,
+				suspect.Wins,
+				suspect.ClusterJoins,
+				table.concat(reasonList, "\n")
+			),
+			inline = false,
+		})
+	end
+
+	local payload = {
+		username = "Bot Fingerprinting",
+		avatar_url = "https://www.roblox.com/headshot-thumbnail/image?userId=1&width=420&height=420&format=png",
+		embeds = {
+			{
+				title = string.format("Bot Batch (%d Targets)", #currentBatch),
+				color = 0xFF3344,
+				fields = embedFields,
+				footer = {
+					text = string.format("PlaceId: %d | JobId: %s", game.PlaceId, game.JobId),
+				},
+				timestamp = DateTime.now():ToIsoDate(),
+			},
+		},
+	}
+
+	task.spawn(function()
+		local success, response = pcall(function()
+			return HttpService:RequestAsync({
+				Url = CONFIG.WEBHOOK_URL,
+				Method = "POST",
+				Headers = {
+					["Content-Type"] = "application/json",
+				},
+				Body = HttpService:JSONEncode(payload),
+			})
+		end)
+
+		if not success or not (response.StatusCode >= 200 and response.StatusCode < 300) then
+			warn("Webhook failure: " .. tostring(if response then response.StatusMessage else response))
+		end
+
+		isFlushing = false
+		if #outboundQueue > 0 then
+			task.wait(1)
+			flushWebhookQueue()
+		end
+	end)
+end
+
+-- Auto-flush timer
+task.spawn(function()
+	while true do
+		task.wait(CONFIG.BATCH_WINDOW_SECONDS)
+		if #outboundQueue > 0 and not isFlushing then
+			flushWebhookQueue()
+		end
+	end
+end)
+
+local function getAvatarRobuxValue(userId: number): number
+	local totalRobux = 0
+
+	local appearanceOk, appearance = pcall(function()
+		return Players:GetCharacterAppearanceInfoAsync(userId)
+	end)
+
+	if not appearanceOk or not appearance or not appearance.assets then
+		return 0
+	end
+
+	for _, assetData in ipairs(appearance.assets) do
+		local assetId = assetData.id
+		local cachedPrice = assetCostCache[assetId]
+
+		if cachedPrice == nil then
+			local infoOk, info = pcall(function()
+				return MarketplaceService:GetProductInfo(assetId, Enum.InfoType.Asset)
+			end)
+
+			if infoOk and info and info.IsForSale and type(info.PriceInRobux) == "number" then
+				cachedPrice = info.PriceInRobux
+			else
+				cachedPrice = 0
+			end
+			assetCostCache[assetId] = cachedPrice
+		end
+
+		totalRobux += cachedPrice
+		if totalRobux > CONFIG.ROBUX_WHITELIST_THRESHOLD then
+			return totalRobux
+		end
+	end
+
+	return totalRobux
+end
+
+local function trackClusterJoins(userId: number): number
+	if not memoryStoreMap then
+		return 1
+	end
+
+	local joinCount = 1
+	local ok, result = pcall(function()
+		return memoryStoreMap:UpdateAsync(tostring(userId), function(current)
+			local now = os.time()
+			local timestamps = type(current) == "table" and current or {}
+			local activeTimestamps = {}
+
+			for _, ts in ipairs(timestamps) do
+				if (now - ts) <= CONFIG.REJOIN_WINDOW_SECONDS then
+					table.insert(activeTimestamps, ts)
+				end
+			end
+
+			table.insert(activeTimestamps, now)
+			return activeTimestamps, CONFIG.REJOIN_WINDOW_SECONDS * 2
+		end, CONFIG.REJOIN_WINDOW_SECONDS * 2)
+	end)
+
+	if ok and type(result) == "table" then
+		joinCount = #result
+	end
+
+	return joinCount
+end
+
+local function getFriendCount(userId: number): number
+	local count = 0
+	local ok, pages = pcall(function()
+		return Players:GetFriendsAsync(userId)
+	end)
+
+	if ok and pages then
+		count = #pages:GetCurrentPage()
+	end
+
+	return count
+end
+
+local function inspectLeaderstats(player: Player): (number, number)
+	local leaderstats = player:FindFirstChild("leaderstats") or player:WaitForChild("leaderstats", 5)
+	if not leaderstats then
+		return 0, 0
+	end
+
+	local koObj = leaderstats:FindFirstChild("Knockouts") or leaderstats:FindFirstChild("Kills")
+	local winObj = leaderstats:FindFirstChild("Wins")
+
+	local kos = (koObj and koObj:IsA("ValueBase")) and (koObj :: any).Value or 0
+	local wins = (winObj and winObj:IsA("ValueBase")) and (winObj :: any).Value or 0
+
+	return kos, wins
+end
+
+local function evaluatePlayer(player: Player)
+	local userId = player.UserId
+	if flaggedSuspects[userId] then
+		return
+	end
+
+	local score = 0
+	local reasons: { string } = {}
+
+	local avatarCost = getAvatarRobuxValue(userId)
+	if avatarCost > CONFIG.ROBUX_WHITELIST_THRESHOLD then
+		return
+	end
+
+	if avatarCost == 0 then
+		score += 15
+		table.insert(reasons, "Default/Free Starter Rig (0 R$)")
+	end
+
+	local joinFrequency = trackClusterJoins(userId)
+	if joinFrequency >= CONFIG.REJOIN_SPAM_COUNT then
+		score += 35
+		table.insert(reasons, string.format("Join Burst (%d joins in %ds)", joinFrequency, CONFIG.REJOIN_WINDOW_SECONDS))
+	end
+
+	local kos, wins = inspectLeaderstats(player)
+	if kos <= CONFIG.MAX_SUSPECT_KOS and wins >= CONFIG.MIN_SUSPECT_WINS then
+		score += 35
+		table.insert(reasons, string.format("Stat Anomaly (%d KOs vs %d Wins)", kos, wins))
+	end
+
+	if player.AccountAge < 30 then
+		score += 15
+		table.insert(reasons, string.format("Fresh Account (%d days)", player.AccountAge))
+	end
+
+	if getFriendCount(userId) == 0 then
+		score += 10
+		table.insert(reasons, "0 Friends")
+	end
+
+	if string.match(player.Name, "^%a+%d%d%d+$") then
+		score += 10
+		table.insert(reasons, "Bot-Pattern Username (Word + Digits)")
+	end
+
+	if score >= CONFIG.CONFIDENCE_THRESHOLD then
+		local entry: SuspectEntry = {
+			UserId = userId,
+			Name = player.Name,
+			DisplayName = player.DisplayName,
+			Score = score,
+			Reasons = reasons,
+			AvatarCost = avatarCost,
+			KOs = kos,
+			Wins = wins,
+			ClusterJoins = joinFrequency,
+		}
+
+		flaggedSuspects[userId] = entry
+		table.insert(outboundQueue, entry)
+
+		if #outboundQueue >= CONFIG.MAX_BATCH_SIZE then
+			flushWebhookQueue()
+		end
+	end
+end
+
+-- Global Adonis Interface
+_G.BotDetector = {
+	Flagged = flaggedSuspects,
+	Queue = outboundQueue,
+
+	ForceFlush = function()
+		flushWebhookQueue()
+	end,
+
+	Ban = function(targetUserId: number)
+		local success, err = pcall(function()
+			Players:BanAsync({
+				UserIds = { targetUserId },
+				Duration = -1,
+				DisplayReason = "",
+				PrivateReason = "bot crasher",
+				ExcludeAltAccounts = false,
+				ApplyToUniverse = true,
+			})
+		end)
+
+		if success then
+			flaggedSuspects[targetUserId] = nil
+			print(string.format("Banned UserId %d", targetUserId))
+		else
+			warn(string.format("Ban failure for %d: %s", targetUserId, tostring(err)))
+		end
+	end,
+
+	BanAll = function()
+		for id, _ in pairs(flaggedSuspects) do
+			_G.BotDetector.Ban(id)
+		end
+	end,
+}
+
+for _, existingPlayer in ipairs(Players:GetPlayers()) do
+	task.spawn(evaluatePlayer, existingPlayer)
+end
+
+Players.PlayerAdded:Connect(function(player)
+	task.spawn(evaluatePlayer, player)
+end)
+
+print("Active.")
